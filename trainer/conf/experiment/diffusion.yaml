@@ -1,0 +1,18 @@
+# @package _global_
+defaults:
+  - override /dataset: diffusion
+  - override /criterion: diffusion
+  - override /model: diffusion
+  - override /task: diffusion
+
+accelerator:
+  log_with: null
+
+dataset:
+  dataset_name: yuvalkirstain/dog_small
+  from_disk: false
+  image_column_name: image
+  batch_size: 2
+
+task:
+  num_inference_steps: 1
