@@ -49,9 +49,8 @@ class DiffusionTaskConfig(BaseTaskConfig):
 
 class DiffusionTask(BaseTask):
     def __init__(self, cfg: DiffusionTaskConfig, accelerator: BaseAccelerator):
+        self.super().__init__(cfg, accelerator)
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.pretrained_model_name_or_path, subfolder="tokenizer")
-        self.accelerator = accelerator
-        self.cfg = cfg
         self.unconditional_input_ids = self.init_unconditional_input_ids()
         self.noise_scheduler = instantiate(self.cfg.noise_scheduler_cfg)
 

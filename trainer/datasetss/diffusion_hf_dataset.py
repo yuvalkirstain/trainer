@@ -1,11 +1,14 @@
 from dataclasses import dataclass
+from io import BytesIO
+
 import torch
+from PIL import Image
 from torchvision import transforms
 from datasets import load_from_disk, load_dataset, Dataset
 from hydra.utils import instantiate
 from omegaconf import II
 
-from trainer.datasetss.base_dataset import BaseDataset
+from trainer.datasetss.base_dataset import BaseDataset, BaseDatasetConfig
 
 
 def cat_batch(batch, column_name):
@@ -24,23 +27,18 @@ class TokenizerConfig:
 
 
 @dataclass
-class DiffusionHFDatasetConfig:
+class DiffusionHFDatasetConfig(BaseDatasetConfig):
     _target_: str = "trainer.datasetss.diffusion_hf_dataset.DiffusionHFDataset"
     dataset_name: str = "data/datasets/PickaPic_reward.ds"
     dataset_config_name: str = "null"
     image_column_name: str = "good_jpg"
     caption_column_name: str = "caption"
     from_disk: bool = True
-    train_split_name: str = "train"
-    valid_split_name: str = "validation"
-    test_split_name: str = "test_unique"
     cache_dir: str = ".cache"
 
     tokenizer: TokenizerConfig = TokenizerConfig()
 
-    batch_size: int = 8
-    num_workers: int = 0
-    drop_last: bool = True
+    batch_size: int = 2
 
     resolution: int = 512
 
@@ -91,7 +89,7 @@ class DiffusionHFDataset(BaseDataset):
         return input_ids
 
     def process_image(self, image):
-        # image = Image.open(BytesIO(image))
+        image = Image.open(BytesIO(image))
         image = image.convert("RGB")
         pixel_values = self.transform(image)
         return pixel_values

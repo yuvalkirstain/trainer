@@ -27,3 +27,6 @@ class CLIPModel(nn.Module):
     def logit_scale(self):
         return self.model.logit_scale
 
+    def save(self, path):
+        self.model.save_pretrained(path)
+

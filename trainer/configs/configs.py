@@ -75,14 +75,20 @@ def instantiate_with_cfg(cfg: DictConfig, **kwargs):
 
 
 defaults = [
-    {"accelerator": "debug"},
+    {"accelerator": "deepspeed"},
     {"task": "clip"},
     {"model": "clip"},
     {"criterion": "clip"},
     {"dataset": "clip"},
-    {"optimizer": "adamw"},
-    {"lr_scheduler": "constant_with_warmup"},
+    {"optimizer": "dummy"},
+    {"lr_scheduler": "dummy"},
 ]
+
+
+@dataclass
+class DebugConfig:
+    activate: bool = False
+    port: int = 5900
 
 
 @dataclass
@@ -95,3 +101,5 @@ class TrainerConfig:
     dataset: Any = MISSING
     optimizer: Any = MISSING
     lr_scheduler: Any = MISSING
+    debug: DebugConfig = DebugConfig()
+    output_dir: str = "outputs"

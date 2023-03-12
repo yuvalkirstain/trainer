@@ -1,0 +1,39 @@
+paths:
+  urls_out_path: data_diff/urls/PickaPic_reward.parquet
+  images_good_out_path: data_diff/images/PickaPic_reward_good.parquet
+  images_bad_out_path: data_diff/images/PickaPic_reward_bad.parquet
+  dataset_out_path: data_diff/datasets/PickaPic_reward.ds
+  ranking_dataset_name: yuvalkirstain/PickaPic-rankings-6-3-2023
+  images_dataset_name: yuvalkirstain/PickaPic-images-6-3-2023
+
+download:
+  process_count: 32
+  thread_count: 32
+  image_size: 512
+  resize_mode: center_crop
+  num_samples_per_shard: 1000
+  max_shard_retry: 5
+  retries: 3
+
+dataset_columns:
+  url_good_col: url_good
+  url_bad_col: url_bad
+  best_uid_col: best_image_uid
+  uid_bad_col: bad_image_uid
+  text_col: prompt
+  image_1_col_name: image_1_uid
+  image_2_col_name: image_2_uid
+  image_3_col_name: image_3_uid
+  image_4_col_name: image_4_uid
+  output_text_col: caption
+
+split:
+  test_size: 2000
+  max_interactions_per_user: 100
+  max_interactions_per_prompt: 10
+
+hydra:
+  run:
+    dir: .
+
+

@@ -5,3 +5,7 @@ defaults:
 hydra:
   run:
     dir: .
+
+debug:
+  activate: false
+  port: 5900

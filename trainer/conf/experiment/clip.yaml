@@ -1,2 +1,7 @@
 # @package _global_
 
+output_dir: vanilla_clip_outputs
+
+dataset:
+  dataset_name: data_diff/datasets/PickaPic_reward.ds
+  batch_size: 32

@@ -14,13 +14,14 @@ import transformers
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed as accelerate_set_seed, PrecisionType
 from accelerate.utils.dataclasses import BaseEnum, LoggerType
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, II
 from tqdm import tqdm
 
 from trainer.accelerators.utils import get_nvidia_smi_gpu_memory_stats_str, print_config
 
 logger = get_logger(__name__)
 
+TRAINING_STAGE_PATH = "training_stage.json"
 
 def debug(port):
     logger.info("Connecting to debugger...")
@@ -39,16 +40,21 @@ class TrainingMode(BaseEnum):
     TRAINING = "training"
 
 
+class MetricMode(BaseEnum):
+    MAX = "max"
+    MIN = "min"
+
+
 @dataclass
 class BaseAcceleratorConfig:
     _target_: str = "trainer.accelerators.base_accelerator.Accelerator"
-    output_dir: str = "output"
+    output_dir: str = II("output_dir")
     mixed_precision: PrecisionType = PrecisionType.NO
     gradient_accumulation_steps: int = 1
     log_with: Optional[LoggerType] = LoggerType.WANDB
     debug: DebugConfig = DebugConfig()
     seed: int = 42
-    resume_from_checkpoint: bool = False
+    resume_from_checkpoint: bool = True
     max_steps: int = 1000
     num_epochs: int = 10
     validate_steps: int = 100
@@ -56,6 +62,8 @@ class BaseAcceleratorConfig:
     project_name: str = "reward"
     max_grad_norm: float = 1.0
     save_steps: int = 100
+    metric_name: str = "accuracy"
+    metric_mode: MetricMode = MetricMode.MAX
 
 
 class BaseAccelerator(abc.ABC):
@@ -100,10 +108,12 @@ class BaseAccelerator(abc.ABC):
 
     def get_latest_checkpoint(self):
         all_ckpts = list(glob(os.path.join(self.cfg.output_dir, "checkpoint-*")))
+        if len(all_ckpts) == 0:
+            return
         all_ckpts.sort(key=os.path.getctime)
-        if len(all_ckpts) > 0 and "final" in all_ckpts[-1]:
+        if "final" in all_ckpts[-1]:
             all_ckpts.pop()
-            return all_ckpts[-1]
+        return all_ckpts[-1] if len(all_ckpts) > 0 else None
 
     def load_state_if_needed(self):
         if not self.cfg.resume_from_checkpoint:
@@ -114,8 +124,9 @@ class BaseAccelerator(abc.ABC):
             logger.info("No checkpoint found, training from scratch")
             return
 
-        stage = json.load(open(os.path.join(ckpt_path, "training_stage.json")))
-        self.epoch, self.step, self.global_step, self.metrics = stage["epoch"], stage["step"], stage["global_step"], stage["metrics"]
+        stage = json.load(open(os.path.join(ckpt_path, TRAINING_STAGE_PATH)))
+        self.epoch, self.step, self.global_step, self.metrics = stage["epoch"], stage["step"], stage["global_step"], \
+            stage["metrics"]
         logger.info(
             f"Resuming from checkpoint: {ckpt_path} | epoch={self.epoch} step={self.step} gstep={self.global_step}")
         self.accelerator.load_state(ckpt_path)
@@ -125,8 +136,12 @@ class BaseAccelerator(abc.ABC):
     def is_main_process(self):
         return self.accelerator.is_main_process
 
+    @property
+    def num_processes(self):
+        return self.accelerator.num_processes
+
     def pre_training_log(self, cfg: DictConfig):
-        total_batch_size = cfg.dataset.batch_size * self.accelerator.num_processes * self.cfg.gradient_accumulation_steps
+        total_batch_size = cfg.dataset.batch_size * self.num_processes * self.cfg.gradient_accumulation_steps
         logger.info("***** Running training *****")
         logger.info(f"  Instantaneous batch size per device = {cfg.dataset.batch_size}")
         logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
@@ -137,9 +152,10 @@ class BaseAccelerator(abc.ABC):
         logger.info(f"  Mixed precision = {self.cfg.mixed_precision}")
 
     def init_training(self, cfg: DictConfig):
-        self.accelerator.init_trackers(self.cfg.project_name, config=OmegaConf.to_object(cfg))
+        if self.is_main_process:
+            self.accelerator.init_trackers(self.cfg.project_name, config=OmegaConf.to_object(cfg))
+            print_config(cfg)
         logger.info(get_nvidia_smi_gpu_memory_stats_str())
-        print_config(cfg)
         self.pre_training_log(cfg)
         self.progress_bar = tqdm(range(self.cfg.max_steps), disable=not self.accelerator.is_main_process)
         self.progress_bar.set_description("Steps")
@@ -156,17 +172,9 @@ class BaseAccelerator(abc.ABC):
     def update_progbar_step(self):
         self.progress_bar.update(1)
 
-    def should_eval(self):
-        if not self.mode == TrainingMode.TRAINING:
-            return False
-        if self.step == 0 and self.global_step == 0 and self.cfg.eval_on_start:
-            return True
-        if self.accelerator.sync_gradients and self.global_step % self.cfg.validate_steps == 0:
-            return True
-        return False
-
     def log(self, data):
-        self.accelerator.log(data, step=self.global_step)
+        if self.is_main_process:
+            self.accelerator.log(data, step=self.global_step)
 
     def recalc_train_length_after_prepare(self, num_examples):
         num_update_steps_per_epoch = math.ceil(num_examples / self.cfg.gradient_accumulation_steps)
@@ -215,6 +223,9 @@ class BaseAccelerator(abc.ABC):
         self.progress_bar.set_postfix(**logs)
         self.update_progbar_step()
 
+    def wait_for_everyone(self):
+        self.accelerator.wait_for_everyone()
+
     def update_epoch(self):
         if self.mode == TrainingMode.SKIPPING:
             return
@@ -223,7 +234,21 @@ class BaseAccelerator(abc.ABC):
 
     def update_metrics(self, metrics):
         self.metrics.update(metrics)
+        logger.info(f"Metrics: {self.metrics}")
         self.log(metrics)
+
+    def end_training(self):
+        self.accelerator.end_training()
+
+    def unwrap_and_save(self, model):
+        if not self.is_main_process:
+            return
+        model = self.accelerator.unwrap_model(model)
+        save_dir = os.path.join(self.cfg.output_dir, f"checkpoint-final")
+        logger.info(f"Saving final checkpoint to {save_dir}")
+        model.save(save_dir)
+        self.save_training_stage(save_dir)
+        logger.info(f"Saved checkpoint to {save_dir}")
 
     def should_end(self):
         return self.global_step >= self.cfg.max_steps
@@ -234,11 +259,21 @@ class BaseAccelerator(abc.ABC):
     def clip_grad_norm_(self, params):
         self.accelerator.clip_grad_norm_(params, self.cfg.max_grad_norm)
 
+    def should_eval(self):
+        if not self.mode == TrainingMode.TRAINING:
+            return False
+        if self.step == 0 and self.global_step == 0 and self.cfg.eval_on_start:
+            return True
+        if self.sync_gradients and self.global_step % self.cfg.validate_steps == 0:
+            return True
+        return False
+
     def should_save(self):
         return self.sync_gradients and self.global_step > 0 and self.cfg.save_steps > 0 and self.global_step % self.cfg.save_steps == 0
 
-    def save_checkpoint(self):
-        training_stage = {
+    @property
+    def training_stage(self):
+        return {
             "epoch": self.epoch,
             "step": self.step,
             "global_step": self.global_step,
@@ -246,12 +281,33 @@ class BaseAccelerator(abc.ABC):
             "lr": self.lr,
             "metrics": self.metrics,
         }
-        save_hash = hashlib.md5(json.dumps(training_stage, sort_keys=True).encode('utf-8')).hexdigest()
-        save_dir = os.path.join(self.cfg.output_dir, f"checkpoint-{save_hash}")
+
+    def save_training_stage(self, save_dir):
+        json.dump(self.training_stage, open(os.path.join(save_dir, TRAINING_STAGE_PATH), "w"), indent=4)
+
+    def save_checkpoint(self):
+        save_dir = os.path.join(self.cfg.output_dir, f"checkpoint-gstep{self.global_step}")
         logger.info(f"Saving checkpoint to {save_dir}")
-        json.dump(training_stage, open(os.path.join(save_dir, "training_stage.json"), "w"), indent=4)
         self.accelerator.save_state(save_dir)
+        self.save_training_stage(save_dir)
         logger.info(f"Saved checkpoint to {save_dir}")
+
+    def load_best_checkpoint(self):
+        all_ckpts = list(glob(os.path.join(self.cfg.output_dir, f"checkpoint-*")))
+        logger.info(f"Found {len(all_ckpts)} checkpoints in {self.cfg.output_dir}")
+        logger.info(all_ckpts)
+        if len(all_ckpts) == 0:
+            logger.info(f"No checkpoint found in {self.cfg.output_dir} to load. Keeping current model.")
+            return
+        best_ckpt, best_metric_val = None, math.inf if self.cfg.metric_mode == MetricMode.MIN else -math.inf
+        for ckpt in all_ckpts:
+            training_stage = json.load(open(os.path.join(ckpt, TRAINING_STAGE_PATH)))
+            metric_val = training_stage["metrics"][self.cfg.metric_name]
+            if (self.cfg.metric_mode == MetricMode.MIN and metric_val < best_metric_val) or \
+                    (self.cfg.metric_mode == MetricMode.MAX and metric_val > best_metric_val):
+                best_ckpt, best_metric_val = ckpt, metric_val
+        logger.info(f"Loading best checkpoint from {best_ckpt} with metric {self.cfg.metric_name}={best_metric_val}")
+        self.accelerator.load_state(best_ckpt)
 
     @property
     def device(self):

@@ -1,10 +1,12 @@
+import json
+import os
 from typing import Any
 
 import hydra
 import torch
 from hydra.utils import instantiate
 from accelerate.logging import get_logger
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
 from trainer.accelerators.base_accelerator import BaseAccelerator
@@ -15,9 +17,9 @@ logger = get_logger(__name__)
 
 def load_dataloaders(cfg: DictConfig) -> Any:
     dataloaders = {}
-    for split in ["train", "validation", "test"]:
+    for split in [cfg.train_split_name, cfg.valid_split_name, cfg.test_split_name]:
         dataset = instantiate_with_cfg(cfg, split=split)
-        should_shuffle = split == "train"
+        should_shuffle = split == cfg.train_split_name
         dataloaders[split] = torch.utils.data.DataLoader(
             dataset,
             shuffle=should_shuffle,
@@ -44,45 +46,70 @@ def load_task(cfg: DictConfig, accelerator: BaseAccelerator):
     return task
 
 
+def verify_or_write_config(cfg: TrainerConfig):
+    os.makedirs(cfg.output_dir, exist_ok=True)
+    yaml_path = os.path.join(cfg.output_dir, "config.yaml")
+    if not os.path.exists(yaml_path):
+        OmegaConf.save(cfg, yaml_path, resolve=True)
+    with open(yaml_path) as f:
+        existing_config = f.read()
+    if existing_config != OmegaConf.to_yaml(cfg, resolve=True):
+        raise ValueError(f"Config was not saved correctly - {yaml_path}")
+    logger.info(f"Config can be found in {yaml_path}")
+
+
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: TrainerConfig) -> None:
+    if cfg.debug.activate:
+        import pydevd_pycharm
+        pydevd_pycharm.settrace('localhost', port=cfg.debug.port, stdoutToServer=True, stderrToServer=True)
+
     accelerator = instantiate_with_cfg(cfg.accelerator)
+
+    if accelerator.is_main_process:
+        verify_or_write_config(cfg)
+
     task = load_task(cfg.task, accelerator)
-    logger.info(f"task: {task.__class__.__name__}")
-
     model = instantiate_with_cfg(cfg.model)
-    logger.info(f"model: {model.__class__.__name__}")
-    logger.info(f"num. model params: {int(sum(p.numel() for p in model.parameters()) // 1e6)}M")
-    logger.info(f"num. model trainable params: {int(sum(p.numel() for p in model.parameters() if p.requires_grad) // 1e6)}M")
-
     criterion = instantiate_with_cfg(cfg.criterion)
-    logger.info(f"criterion: {criterion.__class__.__name__}")
-
-    dataloaders = load_dataloaders(cfg.dataset)
-
+    split2dataloader = load_dataloaders(cfg.dataset)
     optimizer = load_optimizer(cfg.optimizer, model)
     lr_scheduler = load_scheduler(cfg.lr_scheduler, optimizer)
 
-    model, optimizer, lr_scheduler, dataloaders = accelerator.prepare(model, optimizer, lr_scheduler, dataloaders)
+    dataloaders = list(split2dataloader.values())
+    model, optimizer, lr_scheduler, *dataloaders = accelerator.prepare(model, optimizer, lr_scheduler, *dataloaders)
+    split2dataloader = dict(zip(split2dataloader.keys(), dataloaders))
 
     accelerator.load_state_if_needed()
 
-    accelerator.recalc_train_length_after_prepare(len(dataloaders["train"]))
+    accelerator.recalc_train_length_after_prepare(len(split2dataloader[cfg.dataset.train_split_name]))
 
-    if accelerator.is_main_process:
-        accelerator.init_training(cfg)
+    accelerator.init_training(cfg)
+    logger.info(f"task: {task.__class__.__name__}")
+    logger.info(f"model: {model.__class__.__name__}")
+    logger.info(f"num. model params: {int(sum(p.numel() for p in model.parameters()) // 1e6)}M")
+    logger.info(
+        f"num. model trainable params: {int(sum(p.numel() for p in model.parameters() if p.requires_grad) // 1e6)}M")
+    logger.info(f"criterion: {criterion.__class__.__name__}")
+    logger.info(f"num. train examples: {len(split2dataloader[cfg.dataset.train_split_name].dataset)}")
+    logger.info(f"num. valid examples: {len(split2dataloader[cfg.dataset.valid_split_name].dataset)}")
+    logger.info(f"num. test examples: {len(split2dataloader[cfg.dataset.test_split_name].dataset)}")
 
     for epoch in range(accelerator.cfg.num_epochs):
         train_loss = 0.0
-        for step, batch in enumerate(dataloaders["train"]):
+        for step, batch in enumerate(split2dataloader[cfg.dataset.train_split_name]):
             if accelerator.should_skip(epoch, step):
                 accelerator.update_progbar_step()
                 continue
 
             if accelerator.should_eval():
                 model.eval()
-                metrics = task.evaluate(model, criterion, dataloaders["validation"])
+                logger.info(f"*** Evaluating {cfg.dataset.valid_split_name} ***")
+                metrics = task.evaluate(model, criterion, split2dataloader[cfg.dataset.valid_split_name])
                 accelerator.update_metrics(metrics)
+
+            if accelerator.should_save():
+                accelerator.save_checkpoint()
 
             model.train()
 
@@ -106,9 +133,6 @@ def main(cfg: TrainerConfig) -> None:
 
             accelerator.update_step(avg_loss, lr_scheduler.get_last_lr()[0])
 
-            if accelerator.should_save():
-                accelerator.save_checkpoint()
-
             if accelerator.should_end():
                 break
 
@@ -117,9 +141,16 @@ def main(cfg: TrainerConfig) -> None:
 
         accelerator.update_epoch()
 
+    accelerator.wait_for_everyone()
     accelerator.load_best_checkpoint()
-    task.evaluate(model, criterion, dataloaders["test"])
-    accelerator.save_unwrapped_model()
+    logger.info(f"*** Evaluating {cfg.dataset.valid_split_name} ***")
+    metrics = task.evaluate(model, criterion, split2dataloader[cfg.dataset.valid_split_name])
+    accelerator.update_metrics(metrics)
+    logger.info(f"*** Evaluating {cfg.dataset.test_split_name} ***")
+    metrics = task.evaluate(model, criterion, split2dataloader[cfg.dataset.test_split_name])
+    metrics = {f"{cfg.dataset.test_split_name}_{k}": v for k, v in metrics.items()}
+    accelerator.update_metrics(metrics)
+    accelerator.unwrap_and_save(model)
     accelerator.end_training()
 
 

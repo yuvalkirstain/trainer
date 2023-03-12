@@ -34,10 +34,20 @@ class CLIPTaskConfig(BaseTaskConfig):
     pretrained_model_name_or_path: str = II("model.pretrained_model_name_or_path")
 
 
+def flatten(list_of_lists):
+    return [item for sublist in list_of_lists for item in sublist]
+
+
+def gather_iterable(it, num_processes):
+    output_objects = [None for _ in range(num_processes)]
+    torch.distributed.all_gather_object(output_objects, it)
+    return flatten(output_objects)
+
+
 class CLIPTask(BaseTask):
     def __init__(self, cfg: CLIPTaskConfig, accelerator: BaseAccelerator):
+        super().__init__(cfg, accelerator)
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.pretrained_model_name_or_path)
-        self.accelerator = accelerator
 
     def train_step(self, model, criterion, batch):
         loss = criterion(model, batch)
@@ -53,10 +63,14 @@ class CLIPTask(BaseTask):
         )
         clip_scores = torch.diag(torch.einsum('bd,cd->bc', text_features, image_features))
         bad_clip_scores = torch.diag(torch.einsum('bd,cd->bc', text_features, bad_image_features))
-        return clip_scores, bad_clip_scores
+        denominator = torch.exp(clip_scores) + torch.exp(bad_clip_scores)
+        clip_probes = torch.exp(clip_scores) / denominator
+        bad_clip_probes = torch.exp(bad_clip_scores) / denominator
+        return clip_probes, bad_clip_probes
 
     def run_clip_score(self, model, criterion, dataloader):
         eval_dict = collections.defaultdict(list)
+        logger.info("Running clip score...")
         for batch in dataloader:
             input_ids, pixel_values, bad_pixel_values = batch["input_ids"], batch["pixel_values"], batch[
                 "bad_pixel_values"]
@@ -65,13 +79,21 @@ class CLIPTask(BaseTask):
             eval_dict["captions"] += self.tokenizer.batch_decode(input_ids, skip_special_tokens=True)
             eval_dict["images"] += pixel_values_to_pil_images(pixel_values)
             eval_dict["bad_images"] += pixel_values_to_pil_images(bad_pixel_values)
-            eval_dict["scores"] += clip_scores.tolist()
-            eval_dict["bad_scores"] += bad_clip_scores.tolist()
+            eval_dict["good_probs"] += clip_scores.tolist()
+            eval_dict["bad_probs"] += bad_clip_scores.tolist()
+
+        logger.info("Gathering eval results from all processes...")
+        for k, v in eval_dict.items():
+            eval_dict[k] = gather_iterable(v, self.accelerator.num_processes)
+
         return eval_dict
 
     def evaluate(self, model, criterion, dataloader):
         eval_dict = self.run_clip_score(model, criterion, dataloader)
-        if LoggerType.WANDB == self.accelerator.cfg.log_with and self.accelerator.is_main_process:
+        metrics = {
+            "accuracy": sum(eval_dict["is_correct"]) / len(eval_dict["is_correct"]),
+            "num_samples": len(eval_dict["is_correct"])
+        }
+        if LoggerType.WANDB == self.accelerator.cfg.log_with:
             self.log_to_wandb(eval_dict)
-        metrics = {"accuracy": sum(eval_dict["is_correct"]) / len(eval_dict["is_correct"])}
         return metrics

@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from accelerate.utils import PrecisionType
 from accelerate import Accelerator, DeepSpeedPlugin
-from omegaconf import OmegaConf, MISSING
+from omegaconf import OmegaConf, MISSING, II
 
 from trainer.accelerators.base_accelerator import BaseAcceleratorConfig, BaseAccelerator
 
@@ -49,6 +49,7 @@ class DeepSpeedConfig:
     steps_per_print: int = 1
     train_batch_size: str = "auto"
     train_micro_batch_size_per_gpu: str = "auto"
+    #     train_micro_batch_size_per_gpu: int = II("dataset.batch_size")
     wall_clock_breakdown: bool = False
 
 
@@ -64,7 +65,7 @@ class DeepSpeedAccelerator(BaseAccelerator):
         super().__init__(cfg)
         self.set_mixed_precision()
         deepspeed_plugin = DeepSpeedPlugin(
-            hf_ds_config=OmegaConf.to_container(self.cfg.deepspeed),
+            hf_ds_config=OmegaConf.to_container(self.cfg.deepspeed, resolve=True),
             gradient_accumulation_steps=self.cfg.gradient_accumulation_steps,
         )
         self.cfg.deepspeed_final = OmegaConf.create(deepspeed_plugin.deepspeed_config)
