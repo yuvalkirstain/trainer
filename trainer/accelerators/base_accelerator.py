@@ -18,11 +18,12 @@ from accelerate.utils.dataclasses import BaseEnum, LoggerType
 from omegaconf import DictConfig, OmegaConf, II
 from tqdm import tqdm
 
-from trainer.accelerators.utils import get_nvidia_smi_gpu_memory_stats_str, print_config
+from trainer.accelerators.utils import get_nvidia_smi_gpu_memory_stats_str, print_config, _flatten_dict
 
 logger = get_logger(__name__)
 
 TRAINING_STAGE_PATH = "training_stage.json"
+
 
 def debug(port):
     logger.info("Connecting to debugger...")
@@ -156,7 +157,9 @@ class BaseAccelerator(abc.ABC):
 
     def init_training(self, cfg: DictConfig):
         if self.is_main_process:
-            self.accelerator.init_trackers(self.cfg.project_name, OmegaConf.to_object(cfg))
+            yaml = OmegaConf.to_yaml(cfg, resolve=True, sort_keys=True)
+            log_cfg = _flatten_dict(OmegaConf.create(yaml))
+            self.accelerator.init_trackers(self.cfg.project_name, log_cfg)
             print_config(cfg)
         logger.info(get_nvidia_smi_gpu_memory_stats_str())
         self.pre_training_log(cfg)
@@ -297,7 +300,8 @@ class BaseAccelerator(abc.ABC):
                 cur_metric_val = self.training_stage["metrics"][self.cfg.metric_name]
                 if (self.cfg.metric_mode == MetricMode.MIN and metric_val < cur_metric_val) or \
                         (self.cfg.metric_mode == MetricMode.MAX and metric_val > cur_metric_val):
-                    logger.info(f"Metric {self.cfg.metric_name}={cur_metric_val} is not better than {metric_val} of {ckpt}, skipping checkpoint")
+                    logger.info(
+                        f"Metric {self.cfg.metric_name}={cur_metric_val} is not better than {metric_val} of {ckpt}, skipping checkpoint")
                     return
         self.cleanup_checkpoints()
         self.accelerator.wait_for_everyone()
