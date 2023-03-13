@@ -7,7 +7,7 @@ from torch.nn.modules.loss import _Loss
 @dataclass
 class CLIPCriterionConfig:
     _target_: str = "trainer.criterions.clip_criterion.CLIPCriterion"
-    is_distributed: bool = False
+    is_distributed: bool = True
     pass
 
 
