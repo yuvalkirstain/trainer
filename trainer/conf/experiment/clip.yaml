@@ -1,7 +1,10 @@
 # @package _global_
 
-output_dir: vanilla_clip_outputs
+output_dir: outputs/clip
 
 dataset:
   dataset_name: data_diff/datasets/PickaPic_reward.ds
-  batch_size: 32
+  batch_size: 4
+
+accelerator:
+  mixed_precision: BF16

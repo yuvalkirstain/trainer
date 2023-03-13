@@ -1,0 +1,9 @@
+# @package _global_
+
+defaults:
+  - /experiment/clip
+
+output_dir: outputs/clip_l_lr_${optimizer.lr}_gsteps_${accelerator.max_steps}
+
+model:
+  pretrained_model_name_or_path: laion/CLIP-ViT-L-14-laion2B-s32B-b82K

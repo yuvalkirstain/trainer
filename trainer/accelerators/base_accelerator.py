@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 from dataclasses import field, dataclass
 from glob import glob
 from typing import List, Optional
@@ -55,7 +56,7 @@ class BaseAcceleratorConfig:
     debug: DebugConfig = DebugConfig()
     seed: int = 42
     resume_from_checkpoint: bool = True
-    max_steps: int = 1000
+    max_steps: int = 4000
     num_epochs: int = 10
     validate_steps: int = 100
     eval_on_start: bool = False
@@ -64,6 +65,8 @@ class BaseAcceleratorConfig:
     save_steps: int = 100
     metric_name: str = "accuracy"
     metric_mode: MetricMode = MetricMode.MAX
+    limit_num_checkpoints: int = 1
+    save_only_if_best: bool = True
 
 
 class BaseAccelerator(abc.ABC):
@@ -153,7 +156,7 @@ class BaseAccelerator(abc.ABC):
 
     def init_training(self, cfg: DictConfig):
         if self.is_main_process:
-            self.accelerator.init_trackers(self.cfg.project_name, config=OmegaConf.to_object(cfg))
+            self.accelerator.init_trackers(self.cfg.project_name, OmegaConf.to_object(cfg))
             print_config(cfg)
         logger.info(get_nvidia_smi_gpu_memory_stats_str())
         self.pre_training_log(cfg)
@@ -286,14 +289,29 @@ class BaseAccelerator(abc.ABC):
         json.dump(self.training_stage, open(os.path.join(save_dir, TRAINING_STAGE_PATH), "w"), indent=4)
 
     def save_checkpoint(self):
+        if self.cfg.save_only_if_best:
+            all_ckpts = self.get_all_ckpts()
+            for ckpt in all_ckpts:
+                training_stage = json.load(open(os.path.join(ckpt, TRAINING_STAGE_PATH)))
+                metric_val = training_stage["metrics"][self.cfg.metric_name]
+                cur_metric_val = self.training_stage["metrics"][self.cfg.metric_name]
+                if (self.cfg.metric_mode == MetricMode.MIN and metric_val < cur_metric_val) or \
+                        (self.cfg.metric_mode == MetricMode.MAX and metric_val > cur_metric_val):
+                    logger.info(f"Metric {self.cfg.metric_name}={cur_metric_val} is not better than {metric_val} of {ckpt}, skipping checkpoint")
+                    return
+        self.cleanup_checkpoints()
+        self.accelerator.wait_for_everyone()
         save_dir = os.path.join(self.cfg.output_dir, f"checkpoint-gstep{self.global_step}")
         logger.info(f"Saving checkpoint to {save_dir}")
         self.accelerator.save_state(save_dir)
         self.save_training_stage(save_dir)
         logger.info(f"Saved checkpoint to {save_dir}")
 
+    def get_all_ckpts(self):
+        return list(glob(os.path.join(self.cfg.output_dir, f"checkpoint-*")))
+
     def load_best_checkpoint(self):
-        all_ckpts = list(glob(os.path.join(self.cfg.output_dir, f"checkpoint-*")))
+        all_ckpts = self.get_all_ckpts()
         logger.info(f"Found {len(all_ckpts)} checkpoints in {self.cfg.output_dir}")
         logger.info(all_ckpts)
         if len(all_ckpts) == 0:
@@ -312,3 +330,29 @@ class BaseAccelerator(abc.ABC):
     @property
     def device(self):
         return self.accelerator.device
+
+    def cleanup_checkpoints(self):
+        if self.cfg.limit_num_checkpoints <= 0 or not self.accelerator.is_main_process:
+            logger.info(f"Not cleaning up checkpoints as limit_num_checkpoints={self.cfg.limit_num_checkpoints}")
+            return
+
+        all_ckpts = self.get_all_ckpts()
+        if len(all_ckpts) <= self.cfg.limit_num_checkpoints:
+            logger.info(f"Not cleaning up checkpoints as only {len(all_ckpts)} checkpoints found")
+            return
+
+        logger.info(f"Found {len(all_ckpts)} checkpoints in {self.cfg.output_dir}")
+        metric_vals = []
+        for ckpt in all_ckpts:
+            training_stage = json.load(open(os.path.join(ckpt, TRAINING_STAGE_PATH)))
+            metric_val = training_stage["metrics"][self.cfg.metric_name]
+            metric_vals.append(metric_val)
+        metric_ckpt = list(zip(metric_vals, all_ckpts))
+        metric_ckpt.sort(key=lambda x: x[0], reverse=self.cfg.metric_mode == MetricMode.MAX)
+        ckpts_to_delete = [ckpt for _, ckpt in metric_ckpt[self.cfg.limit_num_checkpoints:]]
+        ckpts_to_delete.sort(key=os.path.getctime)
+
+        ckpts_to_delete = ckpts_to_delete[:-1]
+        for ckpt in ckpts_to_delete:
+            logger.info(f"Deleting checkpoint {ckpt}")
+            shutil.rmtree(ckpt)

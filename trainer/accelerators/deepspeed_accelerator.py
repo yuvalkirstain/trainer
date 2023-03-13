@@ -1,6 +1,8 @@
 import os
 from dataclasses import dataclass, field
 from typing import Any
+
+import torch
 from accelerate.utils import PrecisionType
 from accelerate import Accelerator, DeepSpeedPlugin
 from omegaconf import OmegaConf, MISSING, II
@@ -88,3 +90,13 @@ class DeepSpeedAccelerator(BaseAccelerator):
         else:
             self.cfg.deepspeed.fp16.enabled = False
             self.cfg.deepspeed.bf16.enabled = False
+
+    def prepare(self, *args, device_placement=None):
+        prepared = self.accelerator.prepare(*args, device_placement=device_placement)
+        for obj in prepared:
+            if isinstance(obj, torch.nn.Module):
+                if self.cfg.mixed_precision == PrecisionType.BF16:
+                    obj.forward = torch.autocast(device_type=self.device.type, dtype=torch.bfloat16)(obj.forward)
+                elif self.cfg.mixed_precision == PrecisionType.FP16:
+                    obj.forward = torch.autocast(device_type=self.device.type, dtype=torch.float16)(obj.forward)
+        return prepared

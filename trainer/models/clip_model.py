@@ -23,6 +23,15 @@ class CLIPModel(nn.Module):
     def get_image_features(self, *args, **kwargs):
         return self.model.get_image_features(*args, **kwargs)
 
+    def forward(self, text_inputs=None, image_inputs=None):
+        outputs = ()
+        if text_inputs is not None:
+            outputs += self.model.get_text_features(text_inputs),
+        if image_inputs is not None:
+            outputs += self.model.get_image_features(image_inputs),
+        return outputs
+
+
     @property
     def logit_scale(self):
         return self.model.logit_scale

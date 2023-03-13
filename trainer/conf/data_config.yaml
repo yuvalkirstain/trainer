@@ -1,8 +1,8 @@
 paths:
-  urls_out_path: data_diff/urls/PickaPic_reward.parquet
-  images_good_out_path: data_diff/images/PickaPic_reward_good.parquet
-  images_bad_out_path: data_diff/images/PickaPic_reward_bad.parquet
-  dataset_out_path: data_diff/datasets/PickaPic_reward.ds
+  urls_out_path: data_all/urls/PickaPic_reward.parquet
+  images_good_out_path: data_all/images/PickaPic_reward_good.parquet
+  images_bad_out_path: data_all/images/PickaPic_reward_bad.parquet
+  dataset_out_path: data_all/datasets/PickaPic_reward.ds
   ranking_dataset_name: yuvalkirstain/PickaPic-rankings-6-3-2023
   images_dataset_name: yuvalkirstain/PickaPic-images-6-3-2023
 

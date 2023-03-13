@@ -53,6 +53,7 @@ class CLIPTask(BaseTask):
         loss = criterion(model, batch)
         return loss
 
+    @torch.no_grad()
     def valid_step(self, model, criterion, batch):
         input_ids, pixel_values, bad_pixel_values = batch["input_ids"], batch["pixel_values"], batch["bad_pixel_values"]
         image_features, bad_image_features, text_features = criterion.get_features(
@@ -61,26 +62,25 @@ class CLIPTask(BaseTask):
             input_ids,
             bad_pixel_values
         )
-        clip_scores = torch.diag(torch.einsum('bd,cd->bc', text_features, image_features))
-        bad_clip_scores = torch.diag(torch.einsum('bd,cd->bc', text_features, bad_image_features))
-        denominator = torch.exp(clip_scores) + torch.exp(bad_clip_scores)
-        clip_probes = torch.exp(clip_scores) / denominator
-        bad_clip_probes = torch.exp(bad_clip_scores) / denominator
+        clip_scores = model.logit_scale.exp() * torch.diag(torch.einsum('bd,cd->bc', text_features, image_features))
+        bad_clip_scores = model.logit_scale.exp() * torch.diag(torch.einsum('bd,cd->bc', text_features, bad_image_features))
+        scores = torch.stack([clip_scores, bad_clip_scores], dim=-1)
+        probs = torch.softmax(scores, dim=-1)
+        clip_probes, bad_clip_probes = probs[:, 0], probs[:, 1]
         return clip_probes, bad_clip_probes
 
     def run_clip_score(self, model, criterion, dataloader):
         eval_dict = collections.defaultdict(list)
         logger.info("Running clip score...")
         for batch in dataloader:
-            input_ids, pixel_values, bad_pixel_values = batch["input_ids"], batch["pixel_values"], batch[
-                "bad_pixel_values"]
-            clip_scores, bad_clip_scores = self.valid_step(model, criterion, batch)
-            eval_dict["is_correct"] += (clip_scores > bad_clip_scores).tolist()
+            input_ids, pixel_values, bad_pixel_values = batch["input_ids"], batch["pixel_values"], batch["bad_pixel_values"]
+            clip_probs, bad_clip_probs = self.valid_step(model, criterion, batch)
+            eval_dict["is_correct"] += (clip_probs > bad_clip_probs).tolist()
             eval_dict["captions"] += self.tokenizer.batch_decode(input_ids, skip_special_tokens=True)
             eval_dict["images"] += pixel_values_to_pil_images(pixel_values)
             eval_dict["bad_images"] += pixel_values_to_pil_images(bad_pixel_values)
-            eval_dict["good_probs"] += clip_scores.tolist()
-            eval_dict["bad_probs"] += bad_clip_scores.tolist()
+            eval_dict["good_probs"] += clip_probs.tolist()
+            eval_dict["bad_probs"] += bad_clip_probs.tolist()
 
         logger.info("Gathering eval results from all processes...")
         for k, v in eval_dict.items():
@@ -88,6 +88,7 @@ class CLIPTask(BaseTask):
 
         return eval_dict
 
+    @torch.no_grad()
     def evaluate(self, model, criterion, dataloader):
         eval_dict = self.run_clip_score(model, criterion, dataloader)
         metrics = {

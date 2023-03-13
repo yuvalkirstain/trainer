@@ -69,11 +69,17 @@ def main(cfg: TrainerConfig) -> None:
     if accelerator.is_main_process:
         verify_or_write_config(cfg)
 
+    logger.info(f"Loading task")
     task = load_task(cfg.task, accelerator)
+    logger.info(f"Loading model")
     model = instantiate_with_cfg(cfg.model)
+    logger.info(f"Loading criterion")
     criterion = instantiate_with_cfg(cfg.criterion)
+    logger.info(f"Loading dataloaders")
     split2dataloader = load_dataloaders(cfg.dataset)
+    logger.info(f"Loading optimizer")
     optimizer = load_optimizer(cfg.optimizer, model)
+    logger.info(f"Loading lr scheduler")
     lr_scheduler = load_scheduler(cfg.lr_scheduler, optimizer)
 
     dataloaders = list(split2dataloader.values())
