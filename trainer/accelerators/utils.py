@@ -1,4 +1,5 @@
 import subprocess
+from typing import MutableMapping, Any, Dict
 
 import rich.tree
 import rich.syntax
@@ -54,3 +55,14 @@ def print_config(cfg: DictConfig):
             branch_content = OmegaConf.to_yaml(config_section, resolve=True)
         branch.add(rich.syntax.Syntax(branch_content, "yaml"))
     rich.print(tree)
+
+
+def _flatten_dict(params: MutableMapping, delimiter: str = "/", parent_key: str = "") -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    for k, v in params.items():
+        new_key = parent_key + delimiter + str(k) if parent_key else str(k)
+        if isinstance(v, MutableMapping):
+            result = {**result, **_flatten_dict(v, parent_key=new_key, delimiter=delimiter)}
+        else:
+            result[new_key] = v
+    return result
