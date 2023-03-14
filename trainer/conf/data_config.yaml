@@ -28,7 +28,7 @@ dataset_columns:
   output_text_col: caption
 
 split:
-  test_size: 2000
+  test_size: 500
   max_interactions_per_user: 100
   max_interactions_per_prompt: 10
 

@@ -5,7 +5,6 @@ import torch
 from PIL import Image
 from accelerate.logging import get_logger
 from accelerate.utils import LoggerType
-from hydra.core.config_store import ConfigStore
 from omegaconf import II
 from transformers import AutoTokenizer
 
@@ -15,76 +14,97 @@ from trainer.tasks.base_task import BaseTaskConfig, BaseTask
 logger = get_logger(__name__)
 
 
-def numpy_to_pil(images):
-    images = (images * 255).round().astype("uint8")
-    pil_images = [Image.fromarray(image) for image in images]
-    return pil_images
-
-
-def pixel_values_to_pil_images(pixel_values):
-    images = (pixel_values / 2 + 0.5).clamp(0, 1)
-    images = images.cpu().permute(0, 2, 3, 1).float().numpy()
-    images = numpy_to_pil(images)
-    return images
-
-
 @dataclass
 class CLIPTaskConfig(BaseTaskConfig):
     _target_: str = "trainer.tasks.clip_task.CLIPTask"
     pretrained_model_name_or_path: str = II("model.pretrained_model_name_or_path")
+    label_0_column_name: str = II("dataset.label_0_column_name")
+    label_1_column_name: str = II("dataset.label_1_column_name")
+
+    input_ids_column_name: str = II("dataset.input_ids_column_name")
+    pixels_0_column_name: str = II("dataset.pixels_0_column_name")
+    pixels_1_column_name: str = II("dataset.pixels_1_column_name")
+
 
 
 def flatten(list_of_lists):
     return [item for sublist in list_of_lists for item in sublist]
 
 
-def gather_iterable(it, num_processes):
-    output_objects = [None for _ in range(num_processes)]
-    torch.distributed.all_gather_object(output_objects, it)
-    return flatten(output_objects)
+def numpy_to_pil(images):
+    images = (images * 255).round().astype("uint8")
+    pil_images = [Image.fromarray(image) for image in images]
+    return pil_images
 
 
 class CLIPTask(BaseTask):
     def __init__(self, cfg: CLIPTaskConfig, accelerator: BaseAccelerator):
         super().__init__(cfg, accelerator)
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.pretrained_model_name_or_path)
+        self.cfg = cfg
 
     def train_step(self, model, criterion, batch):
         loss = criterion(model, batch)
         return loss
 
+    @staticmethod
+    def features2probs(model, text_features, image_0_features, image_1_features):
+        image_0_scores = model.logit_scale.exp() * torch.diag(
+            torch.einsum('bd,cd->bc', text_features, image_0_features))
+        image_1_scores = model.logit_scale.exp() * torch.diag(
+            torch.einsum('bd,cd->bc', text_features, image_1_features))
+        scores = torch.stack([image_0_scores, image_1_scores], dim=-1)
+        probs = torch.softmax(scores, dim=-1)
+        image_0_probs, image_1_probs = probs[:, 0], probs[:, 1]
+        return image_0_probs, image_1_probs
+
     @torch.no_grad()
     def valid_step(self, model, criterion, batch):
-        input_ids, pixel_values, bad_pixel_values = batch["input_ids"], batch["pixel_values"], batch["bad_pixel_values"]
-        image_features, bad_image_features, text_features = criterion.get_features(
+        image_0_features, image_1_features, text_features = criterion.get_features(
             model,
-            pixel_values,
-            input_ids,
-            bad_pixel_values
+            batch[self.cfg.input_ids_column_name],
+            batch[self.cfg.pixels_0_column_name],
+            batch[self.cfg.pixels_1_column_name]
         )
-        clip_scores = model.logit_scale.exp() * torch.diag(torch.einsum('bd,cd->bc', text_features, image_features))
-        bad_clip_scores = model.logit_scale.exp() * torch.diag(torch.einsum('bd,cd->bc', text_features, bad_image_features))
-        scores = torch.stack([clip_scores, bad_clip_scores], dim=-1)
-        probs = torch.softmax(scores, dim=-1)
-        clip_probes, bad_clip_probes = probs[:, 0], probs[:, 1]
-        return clip_probes, bad_clip_probes
+        return self.features2probs(model, text_features, image_0_features, image_1_features)
+
+    @staticmethod
+    def pixel_values_to_pil_images(pixel_values):
+        images = (pixel_values / 2 + 0.5).clamp(0, 1)
+        images = images.cpu().permute(0, 2, 3, 1).float().numpy()
+        images = numpy_to_pil(images)
+        return images
+
+    @staticmethod
+    def gather_iterable(it, num_processes):
+        output_objects = [None for _ in range(num_processes)]
+        torch.distributed.all_gather_object(output_objects, it)
+        return flatten(output_objects)
 
     def run_clip_score(self, model, criterion, dataloader):
         eval_dict = collections.defaultdict(list)
         logger.info("Running clip score...")
         for batch in dataloader:
-            input_ids, pixel_values, bad_pixel_values = batch["input_ids"], batch["pixel_values"], batch["bad_pixel_values"]
-            clip_probs, bad_clip_probs = self.valid_step(model, criterion, batch)
-            eval_dict["is_correct"] += (clip_probs > bad_clip_probs).tolist()
-            eval_dict["captions"] += self.tokenizer.batch_decode(input_ids, skip_special_tokens=True)
-            eval_dict["images"] += pixel_values_to_pil_images(pixel_values)
-            eval_dict["bad_images"] += pixel_values_to_pil_images(bad_pixel_values)
-            eval_dict["good_probs"] += clip_probs.tolist()
-            eval_dict["bad_probs"] += bad_clip_probs.tolist()
+            image_0_probs, image_1_probs = self.valid_step(model, criterion, batch)
+            agree_on_0 = (image_0_probs > image_1_probs) * batch[self.cfg.label_0_column_name]
+            agree_on_1 = (image_0_probs < image_1_probs) * batch[self.cfg.label_1_column_name]
+            is_correct = agree_on_0 + agree_on_1
+            eval_dict["is_correct"] += is_correct.tolist()
+            eval_dict["captions"] += self.tokenizer.batch_decode(
+                batch[self.cfg.input_ids_column_name],
+                skip_special_tokens=True
+            )
+            eval_dict["image_0"] += self.pixel_values_to_pil_images(batch[self.cfg.pixels_0_column_name])
+            eval_dict["image_1"] += self.pixel_values_to_pil_images(batch[self.cfg.pixels_1_column_name])
+            eval_dict["prob_0"] += image_0_probs.tolist()
+            eval_dict["prob_1"] += image_1_probs.tolist()
+
+            eval_dict["label_0"] += batch[self.cfg.label_0_column_name].tolist()
+            eval_dict["label_1"] += batch[self.cfg.label_1_column_name].tolist()
 
         logger.info("Gathering eval results from all processes...")
         for k, v in eval_dict.items():
-            eval_dict[k] = gather_iterable(v, self.accelerator.num_processes)
+            eval_dict[k] = self.gather_iterable(v, self.accelerator.num_processes)
 
         return eval_dict
 

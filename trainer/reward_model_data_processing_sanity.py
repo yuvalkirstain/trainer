@@ -362,7 +362,7 @@ def main(cfg: DictConfig) -> None:
     df = df.sample(frac=1, random_state=42).reset_index(drop=True)
 
     logger.info("Splitting dataset by prompt...")
-    non_tie_prompts = list(df[df["has_label"]][cfg.dataset_columns.output_text_col].unique())
+    non_tie_prompts = list(df[df["has_label"]].drop_duplicates("user_id")[cfg.dataset_columns.output_text_col].unique())
     random.shuffle(non_tie_prompts)
     test_prompts = set(non_tie_prompts[:cfg.split.test_size])
     train_df = df[~df[cfg.dataset_columns.output_text_col].isin(test_prompts)]
@@ -373,8 +373,8 @@ def main(cfg: DictConfig) -> None:
     test_df = test_df[test_df[cfg.dataset_columns.output_text_col].isin(test_prompts)]
     unique_val_df = val_df.drop_duplicates(subset=[cfg.dataset_columns.output_text_col])
     unique_test_df = test_df.drop_duplicates(subset=[cfg.dataset_columns.output_text_col])
-    user_unique_val_df = unique_val_df.drop_duplicates(subset=["user_id"])
-    user_unique_test_df = unique_test_df.drop_duplicates(subset=["user_id"])
+    for df in [train_df, val_df, test_df, unique_val_df, unique_test_df]:
+        df["num_example_per_prompt"] = df.groupby(cfg.dataset_columns.output_text_col)[cfg.dataset_columns.output_text_col].transform("count")
 
     logger.info("Creating dataset from dfs...")
     dataset = DatasetDict(
@@ -384,22 +384,20 @@ def main(cfg: DictConfig) -> None:
             "test": Dataset.from_pandas(test_df),
             "validation_unique": Dataset.from_pandas(unique_val_df),
             "test_unique": Dataset.from_pandas(unique_test_df),
-            "validation_unique_user": Dataset.from_pandas(user_unique_val_df),
-            "test_unique_user": Dataset.from_pandas(user_unique_test_df),
         }
     )
 
     logger.info(f"{dataset=}")
     logger.info(f"saving to disk {cfg.paths.dataset_out_path}")
-    dataset.save_to_disk(cfg.paths.dataset_out_path, num_proc=cfg.download.process_count)
+    dataset.save_to_disk(cfg.paths.dataset_out_path, num_proc=16)
 
     # print(f"pushing to hub yuvalkirstain/{cfg.paths.dataset_hub_name}")
     # dataset.push_to_hub(cfg.paths.dataset_hub_name)
 
 
 if __name__ == '__main__':
-    import pydevd_pycharm
-
-    pydevd_pycharm.settrace('localhost', port=5900, stdoutToServer=True, stderrToServer=True)
+    # import pydevd_pycharm
+    #
+    # pydevd_pycharm.settrace('localhost', port=5900, stdoutToServer=True, stderrToServer=True)
 
     main()
